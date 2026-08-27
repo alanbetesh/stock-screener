@@ -1,14 +1,17 @@
 import streamlit as st
 import yfinance as yf
 
+# Page Setup
 st.set_page_config(page_title="Bubble Resilience Screener", page_icon="📈", layout="centered")
 
 st.title("Bubble Resilience Screener")
 st.caption("Benchmark any stock against Dot-Com and AI market extremes using direct SEC/Yahoo financial tables.")
 
+# Search Input
 ticker_input = st.text_input("Enter Stock Ticker Symbol:", value="NVDA").upper().strip()
 
 def evaluate_company(net_cash, ebitda, pe):
+    """Evaluates stock fundamentals against dot-com survival profiles."""
     if net_cash < 0 and ebitda < 0:
         return {
             "status": "red",
@@ -67,21 +70,26 @@ def evaluate_company(net_cash, ebitda, pe):
 
 if st.button("Evaluate Stock", type="primary") or ticker_input:
     if ticker_input:
-        with st.spinner(f"Fetching financial data for {ticker_input}..."):
+        with st.spinner(f"Fetching verified financial statements for {ticker_input}..."):
             try:
                 stock = yf.Ticker(ticker_input)
                 
-                # Fetch price from reliable chart history
+                # 1. Fetch real-time / latest closing price
                 hist = stock.history(period="5d")
                 current_price = float(hist["Close"].iloc[-1]) if not hist.empty else 0.0
 
-                # 1. NET CASH EXTRACTION
+                # 2. Extract Net Cash (Cash + Short Term Investments - Total Debt)
                 total_cash_and_investments = 0.0
                 total_debt = 0.0
                 
                 bs = stock.balance_sheet
                 if not bs.empty:
-                    for key in ["Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents", "Cash Financial"]:
+                    cash_keys = [
+                        "Cash Cash Equivalents And Short Term Investments",
+                        "Cash And Cash Equivalents",
+                        "Cash Financial"
+                    ]
+                    for key in cash_keys:
                         if key in bs.index:
                             total_cash_and_investments = float(bs.loc[key].iloc[0])
                             break
@@ -92,29 +100,35 @@ if st.button("Evaluate Stock", type="primary") or ticker_input:
 
                 net_cash_m = (total_cash_and_investments - total_debt) / 1e6
 
-                # 2. EBITDA EXTRACTION (Trailing 4 quarters or latest annual)
+                # 3. Extract True EBITDA (Operating Income + Depreciation & Amortization over TTM)
                 ebitda = None
                 q_inc = stock.quarterly_income_stmt
-                if not q_inc.empty:
-                    for key in ["EBITDA", "Operating Income", "Gross Profit"]:
-                        if key in q_inc.index:
-                            ebitda = float(q_inc.loc[key].iloc[:4].sum())
-                            break
+                q_cf = stock.quarterly_cash_flow
                 
-                if ebitda is None or ebitda == 0.0:
-                    inc = stock.income_stmt
-                    if not inc.empty:
-                        for key in ["EBITDA", "Operating Income", "Gross Profit"]:
-                            if key in inc.index:
-                                ebitda = float(inc.loc[key].iloc[0])
+                if not q_inc.empty and "Operating Income" in q_inc.index:
+                    trailing_op_inc = float(q_inc.loc["Operating Income"].iloc[:4].sum())
+                    
+                    da = 0.0
+                    if not q_cf.empty:
+                        for da_key in ["Depreciation And Amortization", "Depreciation & Amortization", "Depreciation"]:
+                            if da_key in q_cf.index:
+                                da = float(q_cf.loc[da_key].iloc[:4].sum())
                                 break
+                    
+                    ebitda = trailing_op_inc + da
+                elif not q_inc.empty and "EBITDA" in q_inc.index:
+                    ebitda = float(q_inc.loc["EBITDA"].iloc[:4].sum())
+                else:
+                    # Fallback to annual statement if quarterly is unavailable
+                    inc = stock.income_stmt
+                    if not inc.empty and "Operating Income" in inc.index:
+                        ebitda = float(inc.loc["Operating Income"].iloc[0])
 
                 ebitda_m = (float(ebitda) / 1e6) if ebitda is not None else 0.0
 
-                # 3. DIRECT TRAILING GAAP P/E CALCULATION
+                # 4. Trailing GAAP P/E Calculation
                 pe_ratio = None
                 
-                # Method A: Calculate sum of EPS over trailing 4 quarters
                 if not q_inc.empty:
                     for eps_key in ["Diluted EPS", "Basic EPS"]:
                         if eps_key in q_inc.index:
@@ -123,7 +137,7 @@ if st.button("Evaluate Stock", type="primary") or ticker_input:
                                 pe_ratio = current_price / trailing_eps
                                 break
 
-                # Method B: Fallback to annual diluted EPS
+                # Fallback to annual diluted EPS
                 if pe_ratio is None:
                     inc = stock.income_stmt
                     if not inc.empty:
@@ -134,20 +148,9 @@ if st.button("Evaluate Stock", type="primary") or ticker_input:
                                     pe_ratio = current_price / annual_eps
                                     break
 
-                # Method C: Check fast_info fallback
-                if pe_ratio is None:
-                    try:
-                        mcap = float(stock.fast_info.get("market_cap") or 0.0)
-                        if not q_inc.empty and "Net Income" in q_inc.index:
-                            trailing_net_inc = float(q_inc.loc["Net Income"].iloc[:4].sum())
-                            if trailing_net_inc > 0 and mcap > 0:
-                                pe_ratio = mcap / trailing_net_inc
-                    except Exception:
-                        pass
-
                 company_name = ticker_input
 
-                # Run evaluation
+                # Run evaluation logic
                 result = evaluate_company(net_cash_m, ebitda_m, pe_ratio)
 
                 # UI Display
