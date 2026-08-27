@@ -4,7 +4,7 @@ import yfinance as yf
 st.set_page_config(page_title="Bubble Resilience Screener", page_icon="📈", layout="centered")
 
 st.title("Bubble Resilience Screener")
-st.caption("Benchmark any stock against Dot-Com and AI market extremes using real-time Yahoo Finance data.")
+st.caption("Benchmark any stock against Dot-Com and AI market extremes using direct SEC/Yahoo financial tables.")
 
 ticker_input = st.text_input("Enter Stock Ticker Symbol:", value="NVDA").upper().strip()
 
@@ -36,7 +36,7 @@ def evaluate_company(net_cash, ebitda, pe):
             "parallel": "Super Micro Computer / Telecom Survivors",
             "parallel_notes": "Operating profit offsets debt obligations, but balance sheet flexibility is constrained."
         }
-    else:  # Net Cash > 0 and EBITDA > 0
+    else:  # Net Cash >= 0 and EBITDA >= 0
         if pe is not None and 0 < pe <= 60:
             return {
                 "status": "green",
@@ -60,62 +60,76 @@ def evaluate_company(net_cash, ebitda, pe):
                 "status": "yellow",
                 "badge": "🟡 Profitable Baseline (Yellow)",
                 "title": "Profitable Baseline (Multiple Non-Meaningful)",
-                "desc": "Positive cash reserves and operating earnings, though GAAP net losses make P/E non-meaningful.",
+                "desc": "Positive cash reserves and operating earnings, though GAAP net losses or missing data make P/E non-meaningful.",
                 "parallel": "eBay (Q2 1999 baseline)",
                 "parallel_notes": "Positive operational capture with early-stage net income fluctuations."
             }
 
 if st.button("Evaluate Stock", type="primary") or ticker_input:
     if ticker_input:
-        with st.spinner(f"Fetching financial data for {ticker_input}..."):
+        with st.spinner(f"Fetching verified financial statements for {ticker_input}..."):
             try:
                 stock = yf.Ticker(ticker_input)
-                info = stock.info
-
+                info = stock.info or {}
+                
                 company_name = info.get("shortName") or info.get("longName") or ticker_input
 
-                # 1. Trailing P/E extraction with direct calculation fallback
-                pe_ratio = info.get("trailingPE")
-                if pe_ratio is None:
-                    market_cap = info.get("marketCap")
-                    net_income = info.get("netIncomeToCommon")
-                    if market_cap and net_income and net_income > 0:
-                        pe_ratio = market_cap / net_income
+                # 1. Precise Net Cash Calculation (Cash + ST Investments - Total Debt)
+                bs = stock.balance_sheet
+                total_cash_and_investments = 0.0
+                total_debt = 0.0
+
+                if not bs.empty:
+                    # Look for aggregate cash & investments line items
+                    cash_candidates = [
+                        "Cash Cash Equivalents And Short Term Investments",
+                        "Cash And Cash Equivalents",
+                        "Cash Financial"
+                    ]
+                    for item in cash_candidates:
+                        if item in bs.index:
+                            total_cash_and_investments = float(bs.loc[item].iloc[0])
+                            break
+
+                    debt_candidates = ["Total Debt", "Long Term Debt And Capital Lease Obligation"]
+                    for item in debt_candidates:
+                        if item in bs.index:
+                            total_debt = float(bs.loc[item].iloc[0])
+                            break
+
+                # Fallback to info dict if balance sheet row lookup was missing
+                if total_cash_and_investments == 0.0:
+                    total_cash_and_investments = float(info.get("totalCash") or 0.0)
+                if total_debt == 0.0:
+                    total_debt = float(info.get("totalDebt") or 0.0)
+
+                net_cash = total_cash_and_investments - total_debt
+                net_cash_m = net_cash / 1e6
 
                 # 2. Extract EBITDA
                 ebitda = info.get("ebitda")
                 if ebitda is None:
                     income_stmt = stock.income_stmt
-                    if not income_stmt.empty and "EBITDA" in income_stmt.index:
-                        ebitda = float(income_stmt.loc["EBITDA"].iloc[0])
-                    elif not income_stmt.empty and "Operating Income" in income_stmt.index:
-                        ebitda = float(income_stmt.loc["Operating Income"].iloc[0])
+                    if not income_stmt.empty:
+                        if "EBITDA" in income_stmt.index:
+                            ebitda = float(income_stmt.loc["EBITDA"].iloc[0])
+                        elif "Operating Income" in income_stmt.index:
+                            ebitda = float(income_stmt.loc["Operating Income"].iloc[0])
+                
+                ebitda_m = (float(ebitda) / 1e6) if ebitda is not None else 0.0
 
-                # 3. Extract Cash & Debt for Net Cash
-                total_cash = info.get("totalCash")
-                total_debt = info.get("totalDebt")
+                # 3. Trailing GAAP P/E Resolution
+                pe_ratio = info.get("trailingPE")
+                if pe_ratio is None or pe_ratio == 0:
+                    current_price = info.get("currentPrice") or info.get("regularMarketPrice") or stock.fast_info.get("last_price")
+                    eps = info.get("trailingEps")
+                    if current_price and eps and eps > 0:
+                        pe_ratio = float(current_price) / float(eps)
 
-                if total_cash is None or total_debt is None:
-                    bs = stock.balance_sheet
-                    if not bs.empty:
-                        cash_keys = ["Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments"]
-                        for key in cash_keys:
-                            if key in bs.index:
-                                total_cash = float(bs.loc[key].iloc[0])
-                                break
-                        if "Total Debt" in bs.index:
-                            total_debt = float(bs.loc["Total Debt"].iloc[0])
-
-                total_cash = total_cash or 0
-                total_debt = total_debt or 0
-                net_cash = total_cash - total_debt
-
-                # Convert to Millions
-                net_cash_m = net_cash / 1e6
-                ebitda_m = (ebitda / 1e6) if ebitda is not None else 0
-
+                # Run evaluation
                 result = evaluate_company(net_cash_m, ebitda_m, pe_ratio)
 
+                # UI Display
                 st.markdown("---")
                 if result["status"] == "green":
                     st.success(f"### {result['badge']}\n**{company_name} ({ticker_input})** — {result['title']}")
@@ -131,7 +145,7 @@ if st.button("Evaluate Stock", type="primary") or ticker_input:
                 
                 with col1:
                     st.metric(
-                        label="Net Cash",
+                        label="Net Cash (Cash - Debt)",
                         value=f"${net_cash_m:,.1f}M",
                         delta="Positive Cushion" if net_cash_m >= 0 else "Net Debt",
                         delta_color="normal" if net_cash_m >= 0 else "inverse"
@@ -141,17 +155,17 @@ if st.button("Evaluate Stock", type="primary") or ticker_input:
                     st.metric(
                         label="EBITDA",
                         value=f"${ebitda_m:,.1f}M",
-                        delta="Profitable" if ebitda_m >= 0 else "Operating Deficit",
+                        delta="Profitable" if ebitda_m >= 0 else "Deficit",
                         delta_color="normal" if ebitda_m >= 0 else "inverse"
                     )
 
                 with col3:
-                    pe_display = f"{pe_ratio:.1f}x" if pe_ratio is not None else "N/M (Loss)"
+                    pe_display = f"{pe_ratio:.1f}x" if (pe_ratio is not None and pe_ratio > 0) else "N/M (Loss)"
                     st.metric(
                         label="Trailing GAAP P/E",
                         value=pe_display,
-                        delta="Grounding <= 60x" if (pe_ratio and pe_ratio <= 60) else "Elevated / Speculative",
-                        delta_color="normal" if (pe_ratio and pe_ratio <= 60) else "off"
+                        delta="Grounding <= 60x" if (pe_ratio and 0 < pe_ratio <= 60) else "Elevated / Speculative",
+                        delta_color="normal" if (pe_ratio and 0 < pe_ratio <= 60) else "off"
                     )
 
             except Exception as e:
