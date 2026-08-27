@@ -74,33 +74,51 @@ if st.button("Evaluate Stock", type="primary") or ticker_input:
             try:
                 stock = yf.Ticker(ticker_input)
                 
-                # 1. Fetch real-time / latest closing price
+                # 1. Price
                 hist = stock.history(period="5d")
                 current_price = float(hist["Close"].iloc[-1]) if not hist.empty else 0.0
 
-                # 2. Extract Net Cash (Cash + Short Term Investments - Total Debt)
+                # 2. Extract Verifiable Net Cash from Latest Quarterly Balance Sheet
+                q_bs = stock.quarterly_balance_sheet
                 total_cash_and_investments = 0.0
                 total_debt = 0.0
-                
-                bs = stock.balance_sheet
-                if not bs.empty:
-                    cash_keys = [
-                        "Cash Cash Equivalents And Short Term Investments",
-                        "Cash And Cash Equivalents",
-                        "Cash Financial"
-                    ]
-                    for key in cash_keys:
-                        if key in bs.index:
-                            total_cash_and_investments = float(bs.loc[key].iloc[0])
-                            break
-                    for key in ["Total Debt", "Long Term Debt And Capital Lease Obligation"]:
-                        if key in bs.index:
-                            total_debt = float(bs.loc[key].iloc[0])
-                            break
+                period_date = "Latest Period"
 
-                net_cash_m = (total_cash_and_investments - total_debt) / 1e6
+                if not q_bs.empty:
+                    period_date = q_bs.columns[0].strftime("%b %d, %Y")
+                    
+                    # Cash + Short-Term Marketable Securities
+                    if "Cash Cash Equivalents And Short Term Investments" in q_bs.index:
+                        total_cash_and_investments = float(q_bs.loc["Cash Cash Equivalents And Short Term Investments"].iloc[0])
+                    else:
+                        cash = float(q_bs.loc["Cash And Cash Equivalents"].iloc[0]) if "Cash And Cash Equivalents" in q_bs.index else 0.0
+                        st_inv = float(q_bs.loc["Other Short Term Investments"].iloc[0]) if "Other Short Term Investments" in q_bs.index else 0.0
+                        total_cash_and_investments = cash + st_inv
 
-                # 3. Extract True EBITDA (Operating Income + Depreciation & Amortization over TTM)
+                    # Total Debt calculation
+                    if "Total Debt" in q_bs.index:
+                        total_debt = float(q_bs.loc["Total Debt"].iloc[0])
+                    else:
+                        lt_debt = float(q_bs.loc["Long Term Debt"].iloc[0]) if "Long Term Debt" in q_bs.index else 0.0
+                        st_debt = float(q_bs.loc["Current Debt"].iloc[0]) if "Current Debt" in q_bs.index else 0.0
+                        total_debt = lt_debt + st_debt
+
+                # Fallback to annual balance sheet if quarterly is missing
+                if total_cash_and_investments == 0.0 and total_debt == 0.0:
+                    bs = stock.balance_sheet
+                    if not bs.empty:
+                        period_date = bs.columns[0].strftime("%b %d, %Y")
+                        if "Cash Cash Equivalents And Short Term Investments" in bs.index:
+                            total_cash_and_investments = float(bs.loc["Cash Cash Equivalents And Short Term Investments"].iloc[0])
+                        if "Total Debt" in bs.index:
+                            total_debt = float(bs.loc["Total Debt"].iloc[0])
+
+                net_cash = total_cash_and_investments - total_debt
+                net_cash_m = net_cash / 1e6
+                total_cash_m = total_cash_and_investments / 1e6
+                total_debt_m = total_debt / 1e6
+
+                # 3. Extract True EBITDA (Operating Income + D&A over TTM)
                 ebitda = None
                 q_inc = stock.quarterly_income_stmt
                 q_cf = stock.quarterly_cash_flow
@@ -118,17 +136,11 @@ if st.button("Evaluate Stock", type="primary") or ticker_input:
                     ebitda = trailing_op_inc + da
                 elif not q_inc.empty and "EBITDA" in q_inc.index:
                     ebitda = float(q_inc.loc["EBITDA"].iloc[:4].sum())
-                else:
-                    # Fallback to annual statement if quarterly is unavailable
-                    inc = stock.income_stmt
-                    if not inc.empty and "Operating Income" in inc.index:
-                        ebitda = float(inc.loc["Operating Income"].iloc[0])
 
                 ebitda_m = (float(ebitda) / 1e6) if ebitda is not None else 0.0
 
                 # 4. Trailing GAAP P/E Calculation
                 pe_ratio = None
-                
                 if not q_inc.empty:
                     for eps_key in ["Diluted EPS", "Basic EPS"]:
                         if eps_key in q_inc.index:
@@ -136,17 +148,6 @@ if st.button("Evaluate Stock", type="primary") or ticker_input:
                             if trailing_eps > 0 and current_price > 0:
                                 pe_ratio = current_price / trailing_eps
                                 break
-
-                # Fallback to annual diluted EPS
-                if pe_ratio is None:
-                    inc = stock.income_stmt
-                    if not inc.empty:
-                        for eps_key in ["Diluted EPS", "Basic EPS"]:
-                            if eps_key in inc.index:
-                                annual_eps = float(inc.loc[eps_key].iloc[0])
-                                if annual_eps > 0 and current_price > 0:
-                                    pe_ratio = current_price / annual_eps
-                                    break
 
                 company_name = ticker_input
 
@@ -169,7 +170,7 @@ if st.button("Evaluate Stock", type="primary") or ticker_input:
                 
                 with col1:
                     st.metric(
-                        label="Net Cash (Cash - Debt)",
+                        label=f"Net Cash ({period_date})",
                         value=f"${net_cash_m:,.1f}M",
                         delta="Positive Cushion" if net_cash_m >= 0 else "Net Debt",
                         delta_color="normal" if net_cash_m >= 0 else "inverse"
@@ -191,6 +192,13 @@ if st.button("Evaluate Stock", type="primary") or ticker_input:
                         delta="Grounding <= 60x" if (pe_ratio and 0 < pe_ratio <= 60) else "Elevated / Speculative",
                         delta_color="normal" if (pe_ratio and 0 < pe_ratio <= 60) else "off"
                     )
+
+                # Detailed Balance Sheet Breakdown Expander
+                with st.expander("🔍 View Balance Sheet Net Cash Audit"):
+                    st.write(f"**Reporting Period:** {period_date}")
+                    st.write(f"• **Cash & Short-Term Investments:** ${total_cash_m:,.1f}M")
+                    st.write(f"• **Total Debt:** ${total_debt_m:,.1f}M")
+                    st.write(f"• **Calculated Net Cash:** ${net_cash_m:,.1f}M")
 
             except Exception as e:
                 st.error(f"Could not retrieve data for '{ticker_input}'. Error: {e}")
