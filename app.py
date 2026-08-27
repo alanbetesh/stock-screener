@@ -6,7 +6,7 @@ st.set_page_config(page_title="Bubble Resilience Screener", page_icon="📈", la
 st.title("Bubble Resilience Screener")
 st.caption("Benchmark any stock against Dot-Com and AI market extremes using direct SEC/Yahoo financial tables.")
 
-ticker_input = st.text_input("Enter Stock Ticker Symbol:", value="NVDA").upper().strip()
+ticker_input = st.text_input("Enter Stock Ticker Symbol:", value="MSFT").upper().strip()
 
 def evaluate_company(net_cash, ebitda, pe):
     if net_cash < 0 and ebitda < 0:
@@ -67,69 +67,89 @@ def evaluate_company(net_cash, ebitda, pe):
 
 if st.button("Evaluate Stock", type="primary") or ticker_input:
     if ticker_input:
-        with st.spinner(f"Fetching verified financial statements for {ticker_input}..."):
+        with st.spinner(f"Fetching financial data for {ticker_input}..."):
             try:
                 stock = yf.Ticker(ticker_input)
-                info = stock.info or {}
                 
+                # Fetch available datasets
+                info = {}
+                try:
+                    info = stock.info or {}
+                except Exception:
+                    pass
+
                 company_name = info.get("shortName") or info.get("longName") or ticker_input
 
-                # 1. Precise Net Cash Calculation (Cash + ST Investments - Total Debt)
-                bs = stock.balance_sheet
-                total_cash_and_investments = 0.0
-                total_debt = 0.0
+                # 1. NET CASH EXTRACTION
+                total_cash = info.get("totalCash")
+                total_debt = info.get("totalDebt")
 
-                if not bs.empty:
-                    # Look for aggregate cash & investments line items
-                    cash_candidates = [
-                        "Cash Cash Equivalents And Short Term Investments",
-                        "Cash And Cash Equivalents",
-                        "Cash Financial"
-                    ]
-                    for item in cash_candidates:
-                        if item in bs.index:
-                            total_cash_and_investments = float(bs.loc[item].iloc[0])
-                            break
+                if total_cash is None or total_debt is None:
+                    try:
+                        bs = stock.balance_sheet
+                        if not bs.empty:
+                            for key in ["Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents", "Cash Financial"]:
+                                if key in bs.index:
+                                    total_cash = float(bs.loc[key].iloc[0])
+                                    break
+                            for key in ["Total Debt", "Long Term Debt And Capital Lease Obligation"]:
+                                if key in bs.index:
+                                    total_debt = float(bs.loc[key].iloc[0])
+                                    break
+                    except Exception:
+                        pass
 
-                    debt_candidates = ["Total Debt", "Long Term Debt And Capital Lease Obligation"]
-                    for item in debt_candidates:
-                        if item in bs.index:
-                            total_debt = float(bs.loc[item].iloc[0])
-                            break
+                total_cash = float(total_cash or 0.0)
+                total_debt = float(total_debt or 0.0)
+                net_cash_m = (total_cash - total_debt) / 1e6
 
-                # Fallback to info dict if balance sheet row lookup was missing
-                if total_cash_and_investments == 0.0:
-                    total_cash_and_investments = float(info.get("totalCash") or 0.0)
-                if total_debt == 0.0:
-                    total_debt = float(info.get("totalDebt") or 0.0)
-
-                net_cash = total_cash_and_investments - total_debt
-                net_cash_m = net_cash / 1e6
-
-                # 2. Extract EBITDA
+                # 2. EBITDA EXTRACTION
                 ebitda = info.get("ebitda")
                 if ebitda is None:
-                    income_stmt = stock.income_stmt
-                    if not income_stmt.empty:
-                        if "EBITDA" in income_stmt.index:
-                            ebitda = float(income_stmt.loc["EBITDA"].iloc[0])
-                        elif "Operating Income" in income_stmt.index:
-                            ebitda = float(income_stmt.loc["Operating Income"].iloc[0])
+                    try:
+                        income_stmt = stock.income_stmt
+                        if not income_stmt.empty:
+                            for item in ["EBITDA", "Operating Income", "Gross Profit"]:
+                                if item in income_stmt.index:
+                                    ebitda = float(income_stmt.loc[item].iloc[0])
+                                    break
+                    except Exception:
+                        pass
                 
                 ebitda_m = (float(ebitda) / 1e6) if ebitda is not None else 0.0
 
-                # 3. Trailing GAAP P/E Resolution
+                # 3. TRAILING GAAP P/E RESOLUTION (Multi-layered fallback for Cloud)
                 pe_ratio = info.get("trailingPE")
+                
+                # Fallback A: Price / EPS
                 if pe_ratio is None or pe_ratio == 0:
-                    current_price = info.get("currentPrice") or info.get("regularMarketPrice") or stock.fast_info.get("last_price")
+                    current_price = info.get("currentPrice") or info.get("regularMarketPrice")
+                    if not current_price:
+                        try:
+                            current_price = stock.fast_info.get("last_price")
+                        except Exception:
+                            pass
+                    
                     eps = info.get("trailingEps")
                     if current_price and eps and eps > 0:
                         pe_ratio = float(current_price) / float(eps)
 
+                # Fallback B: Market Cap / Net Income
+                if pe_ratio is None or pe_ratio == 0:
+                    try:
+                        market_cap = stock.fast_info.get("market_cap") or info.get("marketCap")
+                        income_stmt = stock.income_stmt
+                        if not income_stmt.empty and "Net Income" in income_stmt.index:
+                            net_income = float(income_stmt.loc["Net Income"].iloc[0])
+                            if market_cap and net_income > 0:
+                                pe_ratio = float(market_cap) / net_income
+                    except Exception:
+                        pass
+
                 # Run evaluation
                 result = evaluate_company(net_cash_m, ebitda_m, pe_ratio)
 
-                # UI Display
+                # Display Card
                 st.markdown("---")
                 if result["status"] == "green":
                     st.success(f"### {result['badge']}\n**{company_name} ({ticker_input})** — {result['title']}")
@@ -141,6 +161,7 @@ if st.button("Evaluate Stock", type="primary") or ticker_input:
                 st.write(result["desc"])
                 st.info(f"**Historical Parallel:** {result['parallel']}\n\n*{result['parallel_notes']}*")
 
+                # Metrics Grid
                 col1, col2, col3 = st.columns(3)
                 
                 with col1:
