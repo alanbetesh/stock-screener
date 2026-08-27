@@ -1,17 +1,14 @@
 import streamlit as st
 import yfinance as yf
 
-# Page Setup
 st.set_page_config(page_title="Bubble Resilience Screener", page_icon="📈", layout="centered")
 
 st.title("Bubble Resilience Screener")
 st.caption("Benchmark any stock against Dot-Com and AI market extremes using real-time Yahoo Finance data.")
 
-# Search Input
 ticker_input = st.text_input("Enter Stock Ticker Symbol:", value="NVDA").upper().strip()
 
 def evaluate_company(net_cash, ebitda, pe):
-    """Evaluates stock fundamentals against dot-com survival profiles."""
     if net_cash < 0 and ebitda < 0:
         return {
             "status": "red",
@@ -39,7 +36,7 @@ def evaluate_company(net_cash, ebitda, pe):
             "parallel": "Super Micro Computer / Telecom Survivors",
             "parallel_notes": "Operating profit offsets debt obligations, but balance sheet flexibility is constrained."
         }
-    else: # Net Cash > 0 and EBITDA > 0
+    else:  # Net Cash > 0 and EBITDA > 0
         if pe is not None and 0 < pe <= 60:
             return {
                 "status": "green",
@@ -75,32 +72,50 @@ if st.button("Evaluate Stock", type="primary") or ticker_input:
                 stock = yf.Ticker(ticker_input)
                 info = stock.info
 
-                # Extract Key Metrics
                 company_name = info.get("shortName") or info.get("longName") or ticker_input
+
+                # 1. Trailing P/E extraction with direct calculation fallback
+                pe_ratio = info.get("trailingPE")
+                if pe_ratio is None:
+                    market_cap = info.get("marketCap")
+                    net_income = info.get("netIncomeToCommon")
+                    if market_cap and net_income and net_income > 0:
+                        pe_ratio = market_cap / net_income
+
+                # 2. Extract EBITDA
+                ebitda = info.get("ebitda")
+                if ebitda is None:
+                    income_stmt = stock.income_stmt
+                    if not income_stmt.empty and "EBITDA" in income_stmt.index:
+                        ebitda = float(income_stmt.loc["EBITDA"].iloc[0])
+                    elif not income_stmt.empty and "Operating Income" in income_stmt.index:
+                        ebitda = float(income_stmt.loc["Operating Income"].iloc[0])
+
+                # 3. Extract Cash & Debt for Net Cash
                 total_cash = info.get("totalCash")
                 total_debt = info.get("totalDebt")
-                ebitda = info.get("ebitda")
-                pe_ratio = info.get("trailingPE")
 
-                # Fallback to balance sheet if cash/debt are missing in fast info
                 if total_cash is None or total_debt is None:
-                    bs = stock.quarterly_balance_sheet
+                    bs = stock.balance_sheet
                     if not bs.empty:
-                        total_cash = total_cash or bs.loc["Cash And Cash Equivalents"].iloc[0] if "Cash And Cash Equivalents" in bs.index else 0
-                        total_debt = total_debt or bs.loc["Total Debt"].iloc[0] if "Total Debt" in bs.index else 0
-                    else:
-                        total_cash = total_cash or 0
-                        total_debt = total_debt or 0
+                        cash_keys = ["Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments"]
+                        for key in cash_keys:
+                            if key in bs.index:
+                                total_cash = float(bs.loc[key].iloc[0])
+                                break
+                        if "Total Debt" in bs.index:
+                            total_debt = float(bs.loc["Total Debt"].iloc[0])
 
-                net_cash = (total_cash or 0) - (total_debt or 0)
+                total_cash = total_cash or 0
+                total_debt = total_debt or 0
+                net_cash = total_cash - total_debt
 
-                # Convert to Millions for Display
+                # Convert to Millions
                 net_cash_m = net_cash / 1e6
                 ebitda_m = (ebitda / 1e6) if ebitda is not None else 0
 
                 result = evaluate_company(net_cash_m, ebitda_m, pe_ratio)
 
-                # Render Verdict
                 st.markdown("---")
                 if result["status"] == "green":
                     st.success(f"### {result['badge']}\n**{company_name} ({ticker_input})** — {result['title']}")
@@ -110,11 +125,8 @@ if st.button("Evaluate Stock", type="primary") or ticker_input:
                     st.error(f"### {result['badge']}\n**{company_name} ({ticker_input})** — {result['title']}")
 
                 st.write(result["desc"])
-
-                # Historical Comparison Box
                 st.info(f"**Historical Parallel:** {result['parallel']}\n\n*{result['parallel_notes']}*")
 
-                # Key Metrics Breakdown
                 col1, col2, col3 = st.columns(3)
                 
                 with col1:
@@ -143,4 +155,4 @@ if st.button("Evaluate Stock", type="primary") or ticker_input:
                     )
 
             except Exception as e:
-                st.error(f"Could not retrieve data for '{ticker_input}'. Please check the ticker symbol and try again. Error: {e}")
+                st.error(f"Could not retrieve data for '{ticker_input}'. Error: {e}")
